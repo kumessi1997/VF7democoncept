@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VF3 HMI Concept</title>
+<meta name="description" content="Giao diện màn hình trung tâm cho xe điện, dựng bằng Rive: xe 3D thời gian thực, điều hòa, giải trí, dẫn đường.">
+<meta property="og:title" content="VF3 HMI Concept">
+<meta property="og:image" content="screens/0_trang_chu.png">
+<style>
+  :root { --bg: #07080a; --panel: rgba(22, 26, 32, 0.92); --edge: rgba(255, 255, 255, 0.12);
+          --text: #f2f3f5; --muted: #9ba1aa; --accent: #ffa41c; --error: #ff6b5e; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+               font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif; }
+  body { display: flex; flex-direction: column; }
+  header { display: flex; align-items: center; gap: 10px; padding: 8px 14px; background: var(--panel);
+           border-bottom: 1px solid var(--edge); flex-wrap: wrap; }
+  header h1 { font-size: 14px; font-weight: 600; margin: 0 6px 0 0; }
+  button, label.btn { background: transparent; color: var(--muted); border: 1px solid var(--edge);
+           border-radius: 9px; padding: 5px 11px; font: inherit; cursor: pointer; }
+  button.on { background: var(--accent); color: #14110b; border-color: var(--accent); font-weight: 600; }
+  label.btn input { display: none; }
+  .keys { font-size: 12px; color: var(--muted); }
+  kbd { border: 1px solid var(--edge); border-radius: 4px; padding: 0 5px; font: inherit; }
+  #status { margin-left: auto; color: var(--muted); font-size: 13px; }
+  #status.error { color: var(--error); }
+  main { position: relative; flex: 1; min-height: 0; }
+  canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; outline: none; }
+  .overlay { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center;
+             justify-content: center; gap: 12px; color: var(--muted); text-align: center; padding: 24px; }
+  .overlay b { color: var(--text); font-size: 18px; font-weight: 600; }
+  .bar { width: min(320px, 70vw); height: 4px; border-radius: 2px; background: rgba(255, 255, 255, 0.1); overflow: hidden; }
+  .bar i { display: block; height: 100%; width: 0; background: var(--accent); transition: width 0.2s; }
+  #drop { display: none; margin: 24px; border: 2px dashed var(--edge); border-radius: 18px; }
+  main.dragging #drop { display: flex; border-color: var(--accent); color: var(--accent); background: rgba(0, 0, 0, 0.6); }
+  /* ?embed=1 : no header, for an <iframe> on another page */
+  body.embed header { display: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>VF3 HMI Concept</h1>
+  <button id="fit-contain" class="on" title="Giữ tỉ lệ 16:9 của thiết kế">Contain</button>
+  <button id="fit-layout" title="Giao diện co giãn theo khung">Layout</button>
+  <button id="replay" title="Phát lại cảnh khởi động (phím 1)">Khởi động lại</button>
+  <button id="full" title="Toàn màn hình (phím F)">Toàn màn hình</button>
+  <label class="btn" title="Mở một file .riv khác">Mở .riv…<input id="file" type="file" accept=".riv"></label>
+  <span class="keys"><kbd>1</kbd> khởi động lại · <kbd>2</kbd> điều khiển nhanh ·
+    <kbd>E</kbd>/<kbd>N</kbd>/<kbd>S</kbd> chế độ lái · <kbd>F</kbd> toàn màn hình</span>
+  <span id="status"></span>
+</header>
+<main id="stage">
+  <canvas id="canvas" tabindex="0"></canvas>
+  <div id="loading" class="overlay">
+    <b>Đang tải VF3 HMI…</b>
+    <div class="bar"><i id="progress"></i></div>
+    <span id="loaded">0 MB</span>
+  </div>
+  <div id="drop" class="overlay">
+    <b>Kéo thả file vf3-hmi.riv vào đây</b>
+    <span>hoặc bấm "Mở .riv…". Trang đang mở trực tiếp từ ổ đĩa (file://) nên trình duyệt không cho tự tải file;
+      chạy qua một web server (xem README.md) thì file tự mở.</span>
+  </div>
+</main>
+
+<!-- Rive web runtime @rive-app/webgl2 2.45.0 (MIT, runtime/LICENSE) -->
+<script src="runtime/rive.js"></script>
+<script>
+  rive.RuntimeLoader.setWasmUrl(new URL('runtime/rive.wasm', document.baseURI).href);
+
+  const RIV = 'vf3-hmi.riv';
+  const ARTBOARD = 'Main', STATE_MACHINE = 'Main';
+  const params = new URLSearchParams(location.search);
+  if (params.get('embed') === '1') document.body.classList.add('embed');
+
+  const canvas = document.getElementById('canvas');
+  const stage = document.getElementById('stage');
+  const statusEl = document.getElementById('status');
+  const loading = document.getElementById('loading');
+  const drop = document.getElementById('drop');
+  let instance = null;
+  let fit = params.get('fit') === 'layout' ? 'layout' : 'contain';
+
+  const setStatus = (text, isError) => { statusEl.textContent = text; statusEl.classList.toggle('error', !!isError); };
+  const layout = () => new rive.Layout({ fit: fit === 'layout' ? rive.Fit.Layout : rive.Fit.Contain,
+                                        alignment: rive.Alignment.Center });
+
+  function start(buffer, label) {
+    if (instance) { instance.cleanup(); instance = null; }
+    loading.style.display = 'none';
+    drop.style.display = 'none';
+    setStatus('Đang mở ' + label + '…');
+    instance = new rive.Rive({
+      canvas, buffer, artboard: ARTBOARD, stateMachines: STATE_MACHINE, autoplay: true,
+      autoBind: true,            // the file's default view model instance (VF3 / SampleData)
+      enableGPUCanvas: true,     // the 3D car is drawn by a script through the GPU API
+      layout: layout(),
+      onLoad: () => {
+        instance.resizeDrawingSurfaceToCanvas();
+        canvas.focus();          // the file's keyboard shortcuts need focus
+        setStatus('');
+      },
+      onLoadError: (e) => setStatus('Không mở được ' + label + ': ' + (e && e.data ? e.data : e), true),
+    });
+  }
+
+  // fetch the .riv with a progress bar (about 24 MB: the 3D car and the music are inside)
+  async function fetchRiv() {
+    const res = await fetch(RIV);
+    if (!res.ok) throw new Error(res.status + ' ' + res.statusText);
+    const total = +res.headers.get('content-length') || 0;
+    const reader = res.body.getReader();
+    const chunks = []; let got = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value); got += value.length;
+      document.getElementById('loaded').textContent = (got / 1048576).toFixed(1) + (total ? ' / ' + (total / 1048576).toFixed(1) : '') + ' MB';
+      if (total) document.getElementById('progress').style.width = (100 * got / total) + '%';
+    }
+    const buf = new Uint8Array(got); let o = 0;
+    for (const c of chunks) { buf.set(c, o); o += c.length; }
+    return buf.buffer;
+  }
+
+  fetchRiv().then((buf) => start(buf, RIV)).catch(() => {
+    loading.style.display = 'none';
+    drop.style.display = 'flex';
+  });
+
+  // another .riv (for example an export from the Rive editor), by picker or drag and drop
+  function openFile(file) {
+    if (!file) return;
+    if (!/\.riv$/i.test(file.name)) { setStatus(file.name + ' không phải file .riv', true); return; }
+    file.arrayBuffer().then((buf) => start(buf, file.name));
+  }
+  document.getElementById('file').onchange = (e) => openFile(e.target.files[0]);
+  stage.addEventListener('dragover', (e) => { e.preventDefault(); stage.classList.add('dragging'); });
+  stage.addEventListener('dragleave', () => stage.classList.remove('dragging'));
+  stage.addEventListener('drop', (e) => { e.preventDefault(); stage.classList.remove('dragging'); openFile(e.dataTransfer.files[0]); });
+
+  function setFit(next) {
+    fit = next;
+    document.getElementById('fit-contain').classList.toggle('on', fit === 'contain');
+    document.getElementById('fit-layout').classList.toggle('on', fit === 'layout');
+    if (instance) { instance.layout = layout(); instance.resizeDrawingSurfaceToCanvas(); }
+  }
+  setFit(fit);
+  document.getElementById('fit-contain').onclick = () => setFit('contain');
+  document.getElementById('fit-layout').onclick = () => setFit('layout');
+
+  // replay the start-up scene through the view model (same as key 1 inside the file)
+  document.getElementById('replay').onclick = () => {
+    const vm = instance && instance.viewModelInstance;
+    if (vm) { vm.number('section').value = 0; vm.number('introPlay').value = 1; }
+    canvas.focus();
+  };
+  const fullscreen = () => (document.fullscreenElement ? document.exitFullscreen() : stage.requestFullscreen());
+  document.getElementById('full').onclick = fullscreen;
+  window.addEventListener('keydown', (e) => {
+    if ((e.key === 'f' || e.key === 'F') && !e.metaKey && !e.ctrlKey && !e.altKey) fullscreen();
+  });
+
+  window.addEventListener('resize', () => instance && instance.resizeDrawingSurfaceToCanvas());
+  document.addEventListener('fullscreenchange', () => setTimeout(() => instance && instance.resizeDrawingSurfaceToCanvas(), 50));
+  canvas.addEventListener('pointerdown', () => canvas.focus());
+  window.addEventListener('error', (e) => setStatus('Lỗi: ' + e.message, true));
+</script>
+</body>
+</html>
